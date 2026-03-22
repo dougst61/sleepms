@@ -1,0 +1,44 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build artifacts - platform-specific binaries
+sleepms-*
+
+# Convenience symlink/copy
+sleepms
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# Environment variables
+.env
+.env.local
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Auto-generated documentation (optional - uncomment if you don't want to commit)
+# GODOC.md
+
+# Backup files
+*.bak
+*.org
+sleepms1.go.org
