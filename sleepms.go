@@ -1,360 +1,318 @@
+// Copyright (c) 2026 Doug Stewart
+
 // Package main implements a sleep utility that waits for a random duration
-// between a minimum and maximum value (in milliseconds).
+// between a minimum and maximum value.
 //
-// The program generates a random sleep duration, displays it to the user,
-// and then sleeps for that duration. The sleep can be interrupted at any
-// time by pressing any key on the keyboard.
-//
-// For sleep durations longer than 1 minute (60,000ms), a progress bar
-// is displayed showing the percentage of time elapsed and a visual
-// indicator of progress.
+// Durations may be specified as plain integers (milliseconds) or as Go
+// duration strings (e.g. 5s, 1m30s, 500ms). For sleep durations of 20
+// seconds or longer a real-time progress bar is shown, including time
+// remaining. The sleep can be interrupted at any time by pressing any key
+// or by sending SIGINT / SIGTERM.
 //
 // Usage:
 //
-//	sleepms <min> <max>
+//	sleepms [options] <min> <max>
 //
-// Arguments:
+// Examples:
 //
-//	min - Minimum sleep duration in milliseconds
-//	max - Maximum sleep duration in milliseconds
-//
-// Example:
-//
-//	sleepms 1000 5000  # Sleep between 1 and 5 seconds
-//	sleepms 60000 120000  # Sleep between 1 and 2 minutes (with progress bar)
+//	sleepms 1000 5000       # between 1 s and 5 s (plain milliseconds)
+//	sleepms 1s 5s           # same, using duration strings
+//	sleepms 1m 2m           # between 1 and 2 minutes (progress bar shown)
+//	sleepms -q 500 2000     # quiet: no output, exit code signals completion
 package main
 
 import (
+	"flag"
 	"fmt"
 	"math/rand"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
-	"golang.org/x/term" // Terminal control for raw mode (keyboard input without echo)
+	"golang.org/x/term"
 )
 
-// Version information variables
-// These are set at build time using -ldflags
+// Version information — overwritten at build time via -ldflags.
 var (
 	AppName         = "sleepms"
 	VersionMajor    = "1"
-	VersionMinor    = "0"
+	VersionMinor    = "1"
 	VersionRevision = "0"
-	BuildNumber     = "00000000" // Overwritten at build time
-	BuildTime       = "unknown"  // Overwritten at build time
+	BuildNumber     = "00000000"
+	BuildTime       = "unknown"
 )
 
-// Constants for progress bar configuration
+// Exit codes returned by the program.
 const (
-	progressBarWidth   = 40    // Width of the progress bar in characters
-	progressThreshold  = 20000 // Threshold in milliseconds (1 minute) for showing progress
-	progressUpdateRate = time.Second
+	exitSuccess   = 0 // sleep completed normally
+	exitInterrupt = 1 // sleep was cut short by keypress or signal
+	exitError     = 2 // bad arguments or terminal setup failure
 )
 
-// main is the entry point of the program. It orchestrates the sleep utility by:
-// 1. Parsing and validating command-line arguments
-// 2. Generating a random sleep duration
-// 3. Setting up the terminal for keyboard input
-// 4. Waiting for the duration (or keyboard interrupt) with optional progress display
+// Progress bar configuration.
+const (
+	progressBarWidth  = 40
+	progressThreshold = 20000 // 20 seconds: minimum duration to show a progress bar
+	progressUpdateHz  = time.Second
+)
+
+// quiet suppresses all printed output when true (-q / --quiet flag).
+var quiet bool
+
 func main() {
-	// Check for version flag
-	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+	os.Exit(run())
+}
+
+// run is the real entry point; returning an int lets deferred cleanup run
+// before os.Exit is called in main.
+func run() int {
+	flag.BoolVar(&quiet, "q", false, "suppress all output")
+	flag.BoolVar(&quiet, "quiet", false, "suppress all output")
+	showVersion := flag.Bool("version", false, "print version and exit")
+	showVersionShort := flag.Bool("v", false, "print version and exit")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] <min> <max>\n\n", AppName)
+		fmt.Fprintf(os.Stderr, "  min, max  Duration as milliseconds (5000) or a Go duration string (5s, 1m30s)\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	if *showVersion || *showVersionShort {
 		fmt.Printf("%s version %s.%s.%s build %s\n", AppName, VersionMajor, VersionMinor, VersionRevision, BuildNumber)
 		fmt.Printf("Built: %s\n", BuildTime)
-		return
+		return exitSuccess
 	}
 
-	// Parse and validate command-line arguments
-	minVal, maxVal, err := parseArguments()
+	minMs, maxMs, err := parsePositionalArgs(flag.Args())
 	if err != nil {
-		fmt.Println("Error:", err)
-		return
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		flag.Usage()
+		return exitError
 	}
 
-	// Generate a random sleep duration between min and max
-	sleepDuration := generateSleepDuration(minVal, maxVal)
-	fmt.Printf("Generated sleep time: %dms\n", sleepDuration)
+	sleepMs := generateSleepDuration(minMs, maxMs)
+	logf("Sleeping for %s (%dms)\n", formatDuration(sleepMs), sleepMs)
 
-	// Set up terminal for raw mode input (keyboard without echo)
-	cleanup, err := setupTerminal()
-	if err != nil {
-		fmt.Println("Error:", err)
-		return
+	// Attempt raw-mode terminal setup for keypress interrupt. If stdin is not
+	// a TTY (e.g. running inside a pipe), skip gracefully.
+	isTTY := term.IsTerminal(int(os.Stdin.Fd()))
+	var cleanup func()
+	if isTTY {
+		if cleanup, err = setupTerminal(); err != nil {
+			isTTY = false
+		}
 	}
-	defer cleanup() // Always restore terminal state on exit
+	if cleanup != nil {
+		defer cleanup()
+	}
 
-	// Wait for the duration or keyboard interrupt
-	waitWithProgress(sleepDuration)
+	// Catch SIGINT and SIGTERM so the terminal is restored before we exit.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	if waitWithProgress(sleepMs, isTTY, sigCh) {
+		logf("Sleep interrupted.\n")
+		return exitInterrupt
+	}
+	logf("Sleep complete.\n")
+	return exitSuccess
 }
 
-// parseArguments parses and validates command-line arguments.
-// It expects exactly 2 arguments: minimum and maximum sleep durations.
-//
-// Returns:
-//   - minVal: The minimum sleep duration in milliseconds
-//   - maxVal: The maximum sleep duration in milliseconds
-//   - error: An error if arguments are invalid or missing
-func parseArguments() (int, int, error) {
-	// Verify that the user provided exactly 2 arguments (min and max).
-	// os.Args[0] is the program name, so we need at least 3 total elements.
-	if len(os.Args) < 3 {
-		return 0, 0, fmt.Errorf("Usage: program <min> <max>")
+// logf writes to stdout unless quiet mode is active.
+func logf(format string, args ...any) {
+	if !quiet {
+		fmt.Printf(format, args...)
 	}
-
-	// Parse the minimum value from the first command-line argument.
-	// strconv.Atoi converts a string to an integer and returns an error
-	// if the string is not a valid integer.
-	minVal, err := strconv.Atoi(os.Args[1])
-	if err != nil {
-		return 0, 0, err
-	}
-
-	// Parse the maximum value from the second command-line argument.
-	maxVal, err := strconv.Atoi(os.Args[2])
-	if err != nil {
-		return 0, 0, err
-	}
-
-	// Validate that the minimum value is not greater than the maximum value.
-	// This is a logical error that would cause issues with random number generation.
-	if minVal > maxVal {
-		return 0, 0, fmt.Errorf("minimum value cannot be greater than maximum value")
-	}
-
-	return minVal, maxVal, nil
 }
 
-// generateSleepDuration generates a random sleep duration between min and max (inclusive).
-// It uses the current time as a seed to ensure different values on each run.
-//
-// Parameters:
-//   - minVal: The minimum sleep duration in milliseconds
-//   - maxVal: The maximum sleep duration in milliseconds
-//
-// Returns:
-//   - A random integer between minVal and maxVal (inclusive)
-func generateSleepDuration(minVal, maxVal int) int {
-	// Create a new random number generator with a seed based on the current time.
-	// Using time.Now().UnixNano() ensures that each run produces different random values.
-	// Note: We use rand.New() instead of the deprecated rand.Seed() function.
+// parsePositionalArgs validates the two positional duration arguments.
+func parsePositionalArgs(args []string) (minMs, maxMs int, err error) {
+	if len(args) != 2 {
+		return 0, 0, fmt.Errorf("expected 2 arguments (min max), got %d", len(args))
+	}
+	minMs, err = parseDurationArg(args[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid min: %w", err)
+	}
+	maxMs, err = parseDurationArg(args[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid max: %w", err)
+	}
+	if minMs > maxMs {
+		return 0, 0, fmt.Errorf("min (%s) must not exceed max (%s)", formatDuration(minMs), formatDuration(maxMs))
+	}
+	return minMs, maxMs, nil
+}
+
+// parseDurationArg accepts either a plain integer (milliseconds) or a Go
+// duration string such as "5s", "1m30s", or "500ms".
+func parseDurationArg(s string) (int, error) {
+	if n, err := strconv.Atoi(s); err == nil {
+		if n < 0 {
+			return 0, fmt.Errorf("duration must be non-negative")
+		}
+		return n, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("use milliseconds (e.g. 5000) or a Go duration string (e.g. 5s, 1m30s, 500ms)")
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("duration must be non-negative")
+	}
+	return int(d.Milliseconds()), nil
+}
+
+// generateSleepDuration returns a uniform random integer in [minMs, maxMs].
+func generateSleepDuration(minMs, maxMs int) int {
+	if minMs == maxMs {
+		return minMs
+	}
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	// Generate a random number between minVal and maxVal (inclusive).
-	// Start with minVal as the default (handles the case where min == max).
-	randomNumber := minVal
-	if minVal != maxVal {
-		// rand.Intn(n) returns a random number in the range [0, n).
-		// To get a range [minVal, maxVal], we:
-		// 1. Calculate the range: (maxVal - minVal + 1)
-		// 2. Get a random number in [0, range)
-		// 3. Add minVal to shift the range to [minVal, maxVal]
-		randomNumber = minVal + rng.Intn(maxVal-minVal+1)
-	}
-
-	return randomNumber
+	return minMs + rng.Intn(maxMs-minMs+1)
 }
 
-// setupTerminal puts the terminal into raw mode for keyboard input without echo.
-// In raw mode:
-//   - Characters are not echoed to the screen
-//   - No line buffering (we get input immediately)
-//   - No special character processing (Ctrl+C, etc.)
+// formatDuration converts a millisecond count to a human-readable string.
 //
-// Returns:
-//   - cleanup: A function to restore the terminal to its original state
-//   - error: An error if terminal setup fails
-func setupTerminal() (func(), error) {
-	// Put the terminal into raw mode so we can detect keypresses without
-	// requiring the user to press Enter.
-	// We save the old terminal state so we can restore it later.
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+// Examples: 250 → "250ms", 3500 → "3.500s", 90234 → "1m 30.234s"
+func formatDuration(ms int) string {
+	d := time.Duration(ms) * time.Millisecond
+	if d < time.Second {
+		return fmt.Sprintf("%dms", ms)
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%.3fs", d.Seconds())
+	}
+	m := int(d.Minutes())
+	s := d.Seconds() - float64(m)*60
+	return fmt.Sprintf("%dm %.3fs", m, s)
+}
+
+// formatRemaining converts a remaining duration to a compact string for the
+// progress bar (rounds to the nearest second).
+//
+// Examples: 45s → "45s", 90s → "1m 30s", 120s → "2m"
+func formatRemaining(d time.Duration) string {
+	d = d.Round(time.Second)
+	if d <= 0 {
+		return "0s"
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	m := int(d.Minutes())
+	s := int(d.Seconds()) % 60
+	if s == 0 {
+		return fmt.Sprintf("%dm", m)
+	}
+	return fmt.Sprintf("%dm %ds", m, s)
+}
+
+// setupTerminal puts stdin into raw mode so individual keypresses are
+// detected without requiring Enter.
+func setupTerminal() (cleanup func(), err error) {
+	old, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		return nil, err
 	}
-
-	// Return a cleanup function that restores the terminal state.
-	// This is critical - without this, the terminal would remain in raw mode and be unusable.
-	cleanup := func() {
-		term.Restore(int(os.Stdin.Fd()), oldState)
-	}
-
-	return cleanup, nil
+	return func() { term.Restore(int(os.Stdin.Fd()), old) }, nil
 }
 
-// waitWithProgress waits for the specified duration or until a key is pressed.
-// For durations longer than 1 minute (60,000ms), it displays a progress bar.
-//
-// Parameters:
-//   - durationMs: The duration to wait in milliseconds
-//
-// The function uses a select statement to wait for one of three events:
-//  1. The timeout channel fires (sleep duration complete)
-//  2. The keyPress channel fires (user interrupted)
-//  3. The progress ticker fires (time to update progress bar)
-func waitWithProgress(durationMs int) {
-	// Create a channel that will receive a signal after the specified duration.
-	// time.After() returns a channel that delivers the current time after
-	// the specified duration has elapsed.
-	timeout := time.After(time.Duration(durationMs) * time.Millisecond)
-
-	// Create a channel to signal when a key is pressed.
-	// This allows us to interrupt the sleep at any time.
-	keyPress := make(chan bool)
-
-	// Launch a goroutine (concurrent function) to listen for keyboard input.
-	// This runs in the background while the main thread waits in the select statement.
-	go listenForKeyPress(keyPress)
-
-	// Determine if we should show progress based on duration
-	showProgress := durationMs >= progressThreshold
-
-	// If showing progress, set up the progress tracking
-	if showProgress {
-		waitWithProgressBar(timeout, keyPress, durationMs)
-	} else {
-		waitSimple(timeout, keyPress)
-	}
-}
-
-// listenForKeyPress listens for a single key press and signals on the provided channel.
-// This function blocks until a key is pressed.
-//
-// Parameters:
-//   - keyPress: Channel to signal when a key is pressed
-func listenForKeyPress(keyPress chan bool) {
-	// Allocate a 1-byte buffer to read a single character.
+// listenForKeyPress blocks until a byte is read from stdin, then closes ch.
+func listenForKeyPress(ch chan<- struct{}) {
 	buf := make([]byte, 1)
-	// Block until a key is pressed. Since we're in raw mode,
-	// this will return immediately when any key is pressed.
-	os.Stdin.Read(buf)
-	// Send a signal on the keyPress channel to notify the main thread.
-	keyPress <- true
+	os.Stdin.Read(buf) //nolint:errcheck // intentional: any read (including EOF) triggers interrupt
+	close(ch)
 }
 
-// waitSimple waits for either a timeout or key press without displaying progress.
-// This is used for short durations (less than 1 minute).
-//
-// Parameters:
-//   - timeout: Channel that signals when the duration has elapsed
-//   - keyPress: Channel that signals when a key is pressed
-func waitSimple(timeout <-chan time.Time, keyPress chan bool) {
+// waitWithProgress waits for the sleep to complete, a keypress, or a signal.
+// Returns true if the sleep was interrupted before completion.
+func waitWithProgress(durationMs int, isTTY bool, sigCh <-chan os.Signal) bool {
+	timeout := time.After(time.Duration(durationMs) * time.Millisecond)
+	keyPress := make(chan struct{})
+	if isTTY {
+		go listenForKeyPress(keyPress)
+	}
+	if durationMs >= progressThreshold {
+		return waitWithProgressBar(timeout, keyPress, sigCh, durationMs)
+	}
+	return waitSimple(timeout, keyPress, sigCh)
+}
+
+// waitSimple handles short sleeps (no progress bar).
+func waitSimple(timeout <-chan time.Time, keyPress <-chan struct{}, sigCh <-chan os.Signal) bool {
 	select {
 	case <-timeout:
-		fmt.Println("Sleep duration complete.")
+		return false
 	case <-keyPress:
-		fmt.Println("Program interrupted by keyboard input.")
+		return true
+	case <-sigCh:
+		return true
 	}
 }
 
-// waitWithProgressBar waits for timeout or key press while displaying a progress bar.
-// This is used for long durations (1 minute or more).
-//
-// Parameters:
-//   - timeout: Channel that signals when the duration has elapsed
-//   - keyPress: Channel that signals when a key is pressed
-//   - durationMs: The total duration in milliseconds
-func waitWithProgressBar(timeout <-chan time.Time, keyPress chan bool, durationMs int) {
-	// Create a ticker that fires every second to update the progress bar.
-	progressTicker := time.NewTicker(progressUpdateRate)
-	defer progressTicker.Stop()
+// waitWithProgressBar handles long sleeps, updating the progress bar each second.
+func waitWithProgressBar(timeout <-chan time.Time, keyPress <-chan struct{}, sigCh <-chan os.Signal, durationMs int) bool {
+	ticker := time.NewTicker(progressUpdateHz)
+	defer ticker.Stop()
 
-	// Record the start time so we can calculate elapsed time.
-	startTime := time.Now()
-	totalDuration := time.Duration(durationMs) * time.Millisecond
+	start := time.Now()
+	total := time.Duration(durationMs) * time.Millisecond
 
-	// Main event loop - wait for timeout, key press, or ticker events
 	for {
 		select {
 		case <-timeout:
-			// Sleep duration has elapsed
 			clearProgressLine()
-			fmt.Println("Sleep duration complete.")
-			return
-
+			return false
 		case <-keyPress:
-			// User pressed a key to interrupt
 			clearProgressLine()
-			fmt.Println("Program interrupted by keyboard input.")
-			return
-
-		case <-progressTicker.C:
-			// Update the progress bar
-			elapsed := time.Since(startTime)
-			updateProgressBar(elapsed, totalDuration)
+			return true
+		case <-sigCh:
+			clearProgressLine()
+			return true
+		case <-ticker.C:
+			if !quiet {
+				updateProgressBar(time.Since(start), total)
+			}
 		}
 	}
 }
 
-// clearProgressLine clears the current line in the terminal.
-// Uses ANSI escape codes:
-//   - \r = carriage return (move cursor to start of line)
-//   - \033[K = clear from cursor to end of line
+// clearProgressLine erases the current terminal line.
 func clearProgressLine() {
-	fmt.Print("\r\033[K")
-}
-
-// updateProgressBar calculates and displays the current progress.
-//
-// Parameters:
-//   - elapsed: Time that has elapsed since start
-//   - total: Total duration to wait
-func updateProgressBar(elapsed, total time.Duration) {
-	// Calculate the percentage of completion.
-	// We convert to float64 for precise division, then back to int for display.
-	percentage := int((float64(elapsed) / float64(total)) * 100)
-
-	// Cap the percentage at 100 to handle any timing edge cases.
-	if percentage > 100 {
-		percentage = 100
+	if !quiet {
+		fmt.Print("\r\033[K")
 	}
-
-	// Render the progress bar string
-	bar := renderProgressBar(percentage)
-
-	// Print the progress bar on the same line (using \r to return to start).
-	// This creates an animated effect where the bar grows over time.
-	// Example output: "Sleeping: [=========>                              ] 25%"
-	fmt.Printf("\rSleeping: [%s] %d%%", bar, percentage)
 }
 
-// renderProgressBar creates a visual progress bar string based on the percentage.
-// The bar is 40 characters wide and shows:
-//   - '=' for completed portions
-//   - '>' for the current position indicator
-//   - ' ' for remaining portions
+// updateProgressBar renders and prints the current progress.
 //
-// Parameters:
-//   - percentage: The completion percentage (0-100)
+// Example output:
 //
-// Returns:
-//   - A string representing the visual progress bar
-//
-// Example outputs:
-//   - 0%:   "                                        "
-//   - 25%:  "==========>                             "
-//   - 50%:  "====================>                   "
-//   - 100%: "========================================"
-func renderProgressBar(percentage int) string {
-	// Calculate how many characters should be "filled" based on percentage.
-	// For example, at 50%, we'd fill 20 out of 40 characters.
-	filledWidth := (percentage * progressBarWidth) / 100
+//	Sleeping: [===================>                    ] 49%   1m 2s remaining
+func updateProgressBar(elapsed, total time.Duration) {
+	pct := min(int((float64(elapsed)/float64(total))*100), 100)
+	remaining := total - elapsed
+	fmt.Printf("\rSleeping: [%s] %3d%%  %s remaining", renderProgressBar(pct), pct, formatRemaining(remaining))
+}
 
-	// Build the progress bar string character by character.
-	bar := ""
-	for i := 0; i < progressBarWidth; i++ {
-		if i < filledWidth {
-			// Characters before the filled width show as '=' (filled)
-			bar += "="
-		} else if i == filledWidth && percentage < 100 {
-			// The character at the filled width shows as '>' (progress indicator)
-			// Don't show '>' at 100% to keep the bar clean
-			bar += ">"
-		} else {
-			// Characters after the filled width show as ' ' (empty)
-			bar += " "
+// renderProgressBar returns a fixed-width ASCII progress bar string.
+func renderProgressBar(pct int) string {
+	filled := (pct * progressBarWidth) / 100
+	bar := make([]byte, progressBarWidth)
+	for i := range bar {
+		switch {
+		case i < filled:
+			bar[i] = '='
+		case i == filled && pct < 100:
+			bar[i] = '>'
+		default:
+			bar[i] = ' '
 		}
 	}
-
-	return bar
+	return string(bar)
 }

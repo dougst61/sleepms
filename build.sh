@@ -17,7 +17,7 @@ PROJECT_DESCRIPTION="Random Sleep Utility with Progress Bar"
 
 # Semantic versioning - update these when releasing new versions
 VERSION_MAJOR="1"
-VERSION_MINOR="0"
+VERSION_MINOR="1"
 VERSION_REVISION="0"
 
 # Source code configuration
