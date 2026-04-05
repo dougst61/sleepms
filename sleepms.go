@@ -53,9 +53,9 @@ const (
 
 // Progress bar configuration.
 const (
-	progressBarWidth  = 40
-	progressThreshold = 20000 // 20 seconds: minimum duration to show a progress bar
-	progressUpdateHz  = time.Second
+	progressBarWidth      = 40
+	progressThreshold     = 20000 // 20 seconds: minimum duration to show a progress bar
+	progressUpdateInterval = time.Second
 )
 
 // quiet suppresses all printed output when true (-q / --quiet flag).
@@ -68,17 +68,23 @@ func main() {
 // run is the real entry point; returning an int lets deferred cleanup run
 // before os.Exit is called in main.
 func run() int {
-	flag.BoolVar(&quiet, "q", false, "suppress all output")
-	flag.BoolVar(&quiet, "quiet", false, "suppress all output")
-	showVersion := flag.Bool("version", false, "print version and exit")
-	showVersionShort := flag.Bool("v", false, "print version and exit")
-	flag.Usage = func() {
+	fs := flag.NewFlagSet(AppName, flag.ContinueOnError)
+	fs.BoolVar(&quiet, "q", false, "suppress all output")
+	fs.BoolVar(&quiet, "quiet", false, "suppress all output")
+	showVersion := fs.Bool("version", false, "print version and exit")
+	showVersionShort := fs.Bool("v", false, "print version and exit")
+	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <min> <max>\n\n", AppName)
 		fmt.Fprintf(os.Stderr, "  min, max  Duration as milliseconds (5000) or a Go duration string (5s, 1m30s)\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
-		flag.PrintDefaults()
+		fs.PrintDefaults()
 	}
-	flag.Parse()
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		if err == flag.ErrHelp {
+			return exitSuccess
+		}
+		return exitError
+	}
 
 	if *showVersion || *showVersionShort {
 		fmt.Printf("%s version %s.%s.%s build %s\n", AppName, VersionMajor, VersionMinor, VersionRevision, BuildNumber)
@@ -86,7 +92,7 @@ func run() int {
 		return exitSuccess
 	}
 
-	minMs, maxMs, err := parsePositionalArgs(flag.Args())
+	minMs, maxMs, err := parsePositionalArgs(fs.Args())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		flag.Usage()
@@ -223,7 +229,11 @@ func setupTerminal() (cleanup func(), err error) {
 	if err != nil {
 		return nil, err
 	}
-	return func() { term.Restore(int(os.Stdin.Fd()), old) }, nil
+	return func() {
+		if err := term.Restore(int(os.Stdin.Fd()), old); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to restore terminal: %v\n", err)
+		}
+	}, nil
 }
 
 // listenForKeyPress blocks until a byte is read from stdin, then closes ch.
@@ -237,8 +247,9 @@ func listenForKeyPress(ch chan<- struct{}) {
 // Returns true if the sleep was interrupted before completion.
 func waitWithProgress(durationMs int, isTTY bool, sigCh <-chan os.Signal) bool {
 	timeout := time.After(time.Duration(durationMs) * time.Millisecond)
-	keyPress := make(chan struct{})
+	var keyPress chan struct{}
 	if isTTY {
+		keyPress = make(chan struct{})
 		go listenForKeyPress(keyPress)
 	}
 	if durationMs >= progressThreshold {
@@ -261,7 +272,7 @@ func waitSimple(timeout <-chan time.Time, keyPress <-chan struct{}, sigCh <-chan
 
 // waitWithProgressBar handles long sleeps, updating the progress bar each second.
 func waitWithProgressBar(timeout <-chan time.Time, keyPress <-chan struct{}, sigCh <-chan os.Signal, durationMs int) bool {
-	ticker := time.NewTicker(progressUpdateHz)
+	ticker := time.NewTicker(progressUpdateInterval)
 	defer ticker.Stop()
 
 	start := time.Now()
