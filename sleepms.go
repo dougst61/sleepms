@@ -105,16 +105,20 @@ func run() int {
 			isTTY = false
 		}
 	}
-	if cleanup != nil {
-		defer cleanup()
-	}
-
 	// Catch SIGINT and SIGTERM so the terminal is restored before we exit.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	if waitWithProgress(sleepMs, isTTY, sigCh) {
+	interrupted := waitWithProgress(sleepMs, isTTY, sigCh)
+
+	// Restore the terminal before printing the final message so that the
+	// shell prompt lands at column 0 (raw mode only issues \n, not \r\n).
+	if cleanup != nil {
+		cleanup()
+	}
+
+	if interrupted {
 		logf("Sleep interrupted.\n")
 		return exitInterrupt
 	}
